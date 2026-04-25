@@ -13,15 +13,24 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/google/uuid"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	fileURIExpiry   = 1 * time.Hour
+	cacheURIExpiry  = 50 * time.Minute
+	cacheKeyPrefix  = "file-uri:"
 )
 
 var (
-	uploadCount  atomic.Int64
-	getFileCount atomic.Int64
+	uploadCount    atomic.Int64
+	getFileCount   atomic.Int64
+	cacheHitCount  atomic.Int64
+	cacheMissCount atomic.Int64
 )
 
 func main() {
@@ -37,11 +46,17 @@ func main() {
 	port := getEnv("PORT", "8080")
 
 	presignClient := buildPresignClient(endpoint, region, accessKey, secretKey)
+	redisClient := buildRedisClient()
+
+	if redisClient != nil {
+		log.Println("[STARTUP] Redis cache enabled")
+	} else {
+		log.Println("[STARTUP] Redis not configured, caching disabled")
+	}
 
 	r := gin.New()
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
-
 	r.Use(memStatsLogger())
 
 	r.GET("/health", func(c *gin.Context) {
@@ -97,22 +112,40 @@ func main() {
 			return
 		}
 
+		if redisClient != nil {
+			if cached, err := redisClient.Get(c, cacheKeyPrefix+key).Result(); err == nil {
+				hits := cacheHitCount.Add(1)
+				count := getFileCount.Add(1)
+				log.Printf("[FILE-URI] key=%s cache=HIT total_file_uris=%d total_cache_hits=%d", key, count, hits)
+				c.JSON(http.StatusOK, gin.H{"uri": cached, "expires_in": "1h", "cached": true})
+				return
+			}
+		}
+
 		presignReq, err := presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(key),
-		}, s3.WithPresignExpires(1*time.Hour))
+		}, s3.WithPresignExpires(fileURIExpiry))
 		if err != nil {
 			log.Printf("[ERROR] get-file-uri key=%s err=%v", key, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate file URI"})
 			return
 		}
 
+		if redisClient != nil {
+			if err := redisClient.Set(c, cacheKeyPrefix+key, presignReq.URL, cacheURIExpiry).Err(); err != nil {
+				log.Printf("[CACHE] failed to store key=%s err=%v", key, err)
+			}
+		}
+
+		misses := cacheMissCount.Add(1)
 		count := getFileCount.Add(1)
-		log.Printf("[FILE-URI] key=%s total_file_uris=%d", key, count)
+		log.Printf("[FILE-URI] key=%s cache=MISS total_file_uris=%d total_cache_misses=%d", key, count, misses)
 
 		c.JSON(http.StatusOK, gin.H{
-			"uri": presignReq.URL,
+			"uri":        presignReq.URL,
 			"expires_in": "1h",
+			"cached":     false,
 		})
 	})
 
@@ -139,7 +172,26 @@ func buildPresignClient(endpoint, region, accessKey, secretKey string) *s3.Presi
 	return s3.NewPresignClient(s3Client)
 }
 
-// memStatsLogger logs memory stats every 60 seconds and attaches alloc to each request log.
+// buildRedisClient returns nil if REDIS_URL is not set.
+func buildRedisClient() *redis.Client {
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		return nil
+	}
+
+	opt, err := redis.ParseURL(redisURL)
+	if err != nil {
+		log.Fatalf("[REDIS] invalid REDIS_URL: %v", err)
+	}
+
+	client := redis.NewClient(opt)
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		log.Fatalf("[REDIS] connection failed: %v", err)
+	}
+
+	return client
+}
+
 func memStatsLogger() gin.HandlerFunc {
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)

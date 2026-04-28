@@ -66,6 +66,7 @@ func main() {
 	r.GET("/get-upload-uri", func(c *gin.Context) {
 		prefix := c.Query("prefix")
 		suffix := c.Query("suffix")
+		ext := c.Query("ext")
 
 		if prefix != "" && len(prefix) != 5 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "prefix must be exactly 5 characters"})
@@ -75,6 +76,14 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "suffix must be exactly 5 characters"})
 			return
 		}
+		if ext != "" {
+			for _, ch := range ext {
+				if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "ext must contain only alphanumeric characters (e.g. jpg, png, mp4)"})
+					return
+				}
+			}
+		}
 
 		id := uuid.New().String()
 		key := id
@@ -83,6 +92,9 @@ func main() {
 		}
 		if suffix != "" {
 			key = key + "-" + suffix
+		}
+		if ext != "" {
+			key = key + "." + ext
 		}
 
 		presignReq, err := presignClient.PresignPutObject(context.Background(), &s3.PutObjectInput{

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -57,6 +59,7 @@ func main() {
 	r := gin.New()
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
+	r.Use(buildCORS())
 	r.Use(memStatsLogger())
 
 	r.GET("/health", func(c *gin.Context) {
@@ -182,6 +185,52 @@ func buildPresignClient(endpoint, region, accessKey, secretKey string) *s3.Presi
 	})
 
 	return s3.NewPresignClient(s3Client)
+}
+
+func buildCORS() gin.HandlerFunc {
+	raw := os.Getenv("CORS_ORIGINS")
+	if raw == "" {
+		log.Println("[STARTUP] CORS_ORIGINS not set, allowing all origins")
+		return cors.New(cors.Config{
+			AllowAllOrigins: true,
+			AllowMethods:    []string{"GET", "POST", "OPTIONS"},
+			AllowHeaders:    []string{"Origin", "Content-Type", "Authorization"},
+			MaxAge:          12 * time.Hour,
+		})
+	}
+
+	var origins []string
+	allowAll := false
+	for _, o := range strings.Split(raw, ",") {
+		o = strings.TrimSpace(o)
+		if o == "" {
+			continue
+		}
+		if o == "*" {
+			allowAll = true
+			break
+		}
+		origins = append(origins, o)
+	}
+
+	if allowAll {
+		log.Println("[STARTUP] CORS allowing all origins (*)")
+		return cors.New(cors.Config{
+			AllowAllOrigins: true,
+			AllowMethods:    []string{"GET", "POST", "OPTIONS"},
+			AllowHeaders:    []string{"Origin", "Content-Type", "Authorization"},
+			MaxAge:          12 * time.Hour,
+		})
+	}
+
+	log.Printf("[STARTUP] CORS allowed origins: %v", origins)
+	return cors.New(cors.Config{
+		AllowOrigins:     origins,
+		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	})
 }
 
 // buildRedisClient returns nil if REDIS_URL is not set.

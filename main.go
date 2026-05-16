@@ -113,6 +113,24 @@ func main() {
 		count := uploadCount.Add(1)
 		log.Printf("[UPLOAD-URI] key=%s total_upload_uris=%d", key, count)
 
+		if redisClient != nil {
+			go func(k string) {
+				getReq, err := presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String(k),
+				}, s3.WithPresignExpires(fileURIExpiry))
+				if err != nil {
+					log.Printf("[PREWARM] failed to presign get-file-uri key=%s err=%v", k, err)
+					return
+				}
+				if err := redisClient.Set(context.Background(), cacheKeyPrefix+k, getReq.URL, cacheURIExpiry).Err(); err != nil {
+					log.Printf("[PREWARM] failed to cache get-file-uri key=%s err=%v", k, err)
+					return
+				}
+				log.Printf("[PREWARM] cached get-file-uri key=%s", k)
+			}(key)
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"key":        key,
 			"uri":        presignReq.URL,
